@@ -1,158 +1,106 @@
-# Ship to Nuvolos — practical guide
+# Ship the TypeScript agent to Nuvolos
 
-End-to-end recipe for pulling this repo onto Nuvolos and getting both stacks
-running. Last verified 2026-05-21 against branch `main` of
-`NlcoIas/company-rag-agent` (fast-forwards Andre's `Nuvolos` branch with the
-audit-fix commit on top).
+End-to-end recipe for running the TS TUI agent (`src/main.ts`) on Nuvolos.
+This is **Edoardo's TS stack**, not Andre's Python backend — different file
+tree, different data store, different runtime.
 
-Two stacks ship from the same checkout:
+Reference: branch `main` of `NlcoIas/company-rag-agent` (your fork — has
+Andre's TS correctness fix `qwen3.5-9b-32k` → `qwen3-8b-32k` baked in;
+Edoardo's upstream `main` *won't run* without that one-line fix).
 
-- **Path A — Python (Andre's full Nuvolos build)**: FastAPI backend + Gradio
-  frontend + pgvector. The team's primary deliverable.
-- **Path B — TypeScript (TUI agent)**: hand-rolled CLI agent over SQLite.
-  Reference implementation; runs in a Nuvolos VS Code terminal.
-
-Both share the same Ollama install on the Backend app. They differ only on
-the data store (pgvector for A, local SQLite for B).
+If you'd rather use Edoardo's upstream directly: clone it, then manually
+edit `src/model.ts:4-5` to swap `qwen3.5-9b-32k` for `qwen3-8b-32k` and
+the name string accordingly.
 
 ---
 
-## 0. Once per Nuvolos workspace
+## 0. Nuvolos workspace setup
 
-Open the Backend VS Code app. Then:
+### Pick the right image (Nuvolos app catalog)
+
+- **Editor / Backend app** → `VSCode 1.108.0 + Py3.13 + UZH LLMs` (2026-03-05).
+  Try this one first — if it ships with Ollama + qwen3 pre-baked, skip the
+  install/pull steps below. Check with `which ollama` and `ollama list`
+  before you start. **Fallback**: `VSCode 1.117.0 with Py3.13` (latest plain).
+- The TS agent doesn't need the **Database** app (that's pgvector for Andre's
+  Python stack). You can leave it stopped.
+- **Frontend** app is also not needed — the TS agent is a CLI TUI, you
+  interact with it in the same terminal where you started it.
+
+### Install Ollama (skip if `which ollama` already returns a path)
+
+Rootless install — Nuvolos containers don't have sudo:
 
 ```bash
-# Rootless Ollama install — system installer needs sudo, this doesn't.
 OLLAMA_VERSION=$(curl -fsSL https://api.github.com/repos/ollama/ollama/releases/latest \
                   | grep '"tag_name"' | cut -d'"' -f4)
 mkdir -p ~/.local
 curl -fsSL "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" \
      -o /tmp/ollama.tar.zst
 tar -x --zstd -f /tmp/ollama.tar.zst -C ~/.local
+```
 
-# Persist PATH + Ollama config on shared LFS so models survive container
-# restarts and KEEP_ALIVE=-1 prevents the 134-second cold-load penalty.
+### Persist PATH and Ollama config
+
+`OLLAMA_MODELS` puts the ~5 GB of weights on the shared LFS so they survive
+container restart. `OLLAMA_KEEP_ALIVE=-1` prevents the 134-second cold-load
+penalty after Ollama's default 5-min idle unload.
+
+```bash
 cat >> ~/.bashrc <<'EOF'
 export PATH="$HOME/.local/bin:$PATH"
 export OLLAMA_MODELS=/space_mounts/pars/ollama_models
 export OLLAMA_KEEP_ALIVE=-1
 EOF
 source ~/.bashrc
+```
 
-# Start the daemon + pull models (~5.5 GB total)
+### Start the daemon and pull both models (~5.5 GB total)
+
+```bash
 ollama serve &
 sleep 2
-ollama pull nomic-embed-text   # 274 MB
-ollama pull qwen3:8b           # 5.2 GB
-# (NO `ollama create` needed — the backend passes num_ctx=32768 via the API)
+ollama pull nomic-embed-text   # 274 MB, for retrieval embeddings
+ollama pull qwen3:8b           # 5.2 GB, the chat model the TS agent uses
+```
 
-# Clone the fork (replace with team URL if different)
+If the Cloudflare CDN closes the connection mid-pull (it sometimes does for
+concurrent pulls): re-run the same `ollama pull` — both are resumable.
+
+---
+
+## 1. Clone your fork
+
+```bash
 cd /files
 git clone https://github.com/NlcoIas/company-rag-agent.git
 cd company-rag-agent
 ```
 
-If you already cloned an earlier copy: `git pull` is enough — every file in
-this guide is already in `main`.
+(If you want only the TS code without the unused Python files, that's a
+cosmetic ask — they're harmless. `npm start` ignores `backend/`,
+`frontend/`, and `indexing/*_pg.*`.)
 
 ---
 
-## Path A — Python stack on Nuvolos
+## 2. Create the `qwen3-8b-32k` custom model
 
-### A.1 Start the Database app (Nuvolos UI)
-
-In Nuvolos, click into your team space and start the **Database** app.
-pgvector is pre-installed. The first start may take 30–60s.
-
-### A.2 Configure env vars (Backend app CONFIGURE panel)
-
-Open the Backend app's CONFIGURE panel and set:
-
-| Var | Value | Notes |
-|---|---|---|
-| `AGENT_API_KEY` | a long random string | Required to enable bearer-token auth — set before exposing the proxy URL to anyone. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| `ENABLE_BASH_TOOL` | `0` | Leave off. Enabling = full RCE in the container (the regex denylist is bypassable). |
-| `ENABLE_FS_READ_TOOL` | `0` | Leave off. Container env carries `PGPASSWORD` and other secrets — `read` is a leak primitive even when sandboxed. |
-| `ENABLE_FS_WRITE_TOOLS` | `0` | Leave off unless the team explicitly wants the agent to write to disk. |
-| `AGENT_FS_ROOT` | unset (default `<cwd>/agent_workspace`) | If FS tools are enabled, sets the sandbox root. Default is safe: not the source tree. |
-| `LLM_TIMEOUT_SEC` | `60` | Default is fine. Bump if you see timeouts on slow `/think` queries. |
-| `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD` / `PGDATABASE` | inherited from Nuvolos service | Defaults match Andre's branch; only change if the Database app's hostname changes (visible in Applications → Database → CONFIGURE). |
-
-> The frontend will need `BACKEND_URL` pointing at the Backend app's
-> hostname on port 8500 (visible in Nuvolos Applications → Backend
-> → CONFIGURE → Network info). Default in `frontend/app.py` is set for the
-> current workspace; override via `BACKEND_URL` env var on the Frontend app
-> if it changes.
-
-### A.3 Build the pgvector index — Backend app, one-time
+The TS agent's `src/model.ts` references the model id `qwen3-8b-32k`,
+which doesn't exist out-of-the-box. The `Modelfile` in the repo root
+creates it (FROM `qwen3:8b` + `PARAMETER num_ctx 32768`):
 
 ```bash
 cd /files/company-rag-agent
-pip install -r backend/requirements.txt pyarrow pandas
-python indexing/build_index_pg.py --input data/raw/documents_subset.parquet
+ollama create qwen3-8b-32k -f Modelfile
+ollama list   # confirm qwen3-8b-32k:latest appears
 ```
 
-~15–30 min on Nuvolos. The script is **resumable** — if it dies, re-run the
-same command and it picks up at the last 200-chunk checkpoint.
-
-Done when you see: `[done] indexing complete — Backend API is ready to serve queries.`
-
-### A.4 Start the API — Backend app, every session
-
-```bash
-# Terminal 1 — keep Ollama up
-ollama serve
-
-# Terminal 2 — the API
-cd /files/company-rag-agent/backend
-uvicorn main:app --host 0.0.0.0 --port 8500
-```
-
-Expected log lines (post-audit-fix):
-
-```
-INFO: Connecting to pgvector @ nv-service-...:5432/nuvolos
-INFO: pgvector connected — 35344 chunks indexed.
-INFO: LLM: http://localhost:11434  model=qwen3:8b  embed=nomic-embed-text  timeout=60.0s
-INFO: Tools enabled: bash=False fs_read=False fs_write=False fs_root=/files/company-rag-agent/backend/agent_workspace
-INFO: Auth: bearer-token
-INFO: Application startup complete.
-INFO: Uvicorn running on http://0.0.0.0:8500
-```
-
-### A.5 Start the UI — Frontend app, every session
-
-```bash
-cd /files/company-rag-agent/frontend
-pip install -r requirements.txt   # first time only
-python app.py
-```
-
-UI: `https://<hash>.proxy-eu1.nuvolos.cloud/proxy/7860/`
-
-If you set `AGENT_API_KEY` in step A.2, also set it as the Frontend's
-`BACKEND_API_KEY` env (frontend reads it and forwards on every request).
-Without this, the frontend will get 401 on every call.
-
-### A.6 Optional — run the retrieval eval
-
-```bash
-cd /files/company-rag-agent
-python indexing/eval_retrieval_pg.py --questions data/raw/questions_test.parquet --top-k 10
-```
-
-Watch the first line: `[eval] model=nomic-embed-text dim=768 fusion=rrf-v1`.
-If you see `[WARN] FUSION_VERSION drift`, the eval and the backend are not
-running the same retriever — fix before reporting numbers.
+This is fast — it just adds a 32k-context layer on top of the existing
+`qwen3:8b` weights. No additional download.
 
 ---
 
-## Path B — TypeScript agent on Nuvolos
-
-This stack is **undocumented in the original README**. Steps below are the
-team-tested recipe.
-
-### B.1 Node 22 (rootless via nvm)
+## 3. Install Node 22 (rootless via nvm)
 
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
@@ -161,14 +109,16 @@ nvm install 22
 node --version   # v22.x.x
 ```
 
-### B.2 Build the SQLite index
+---
 
-The TS agent uses `data/index/rag.db` (SQLite + FTS5 + JSON-encoded dense
-vectors), NOT pgvector. The file is gitignored — build it on Nuvolos.
+## 4. Build the SQLite index (`data/index/rag.db`)
+
+The TS agent uses SQLite + FTS5 + JSON-encoded dense vectors — not
+pgvector. `rag.db` is gitignored and must be built once on Nuvolos.
 
 ```bash
 cd /files/company-rag-agent
-python -m venv data/.venv          # isolated from backend/requirements.txt
+python -m venv data/.venv
 source data/.venv/bin/activate
 pip install pyarrow numpy httpx pandas
 python indexing/build_index.py \
@@ -177,108 +127,99 @@ python indexing/build_index.py \
 deactivate
 ```
 
-~5–10 min on Nuvolos (the embedder is small and Ollama batches well).
-Final size ~318 MB. Resumable.
+Expected time on Nuvolos: ~5–10 minutes (the embedder is small, Ollama
+batches well, GPU helps). Final file is ~318 MB. Resumable — re-run the
+same command if it dies mid-build.
 
-### B.3 Sanity-check retrieval (no LLM)
+---
+
+## 5. Sanity-check retrieval (no LLM, fast)
 
 ```bash
 cd /files/company-rag-agent
-npm install        # ~1 min
+npm install        # ~1 min, installs pi-agent-core + pi-tui + deps
 npx tsx src/rag/smoke.ts "who complained about the November invoice spike from HybridAI?"
 ```
 
 Expect the gmail thread *"Unexpected spike on November invoice - HybridAI
-migration tokens"* as the top hit, score ≈ 2.6.
+migration tokens"* as the top hit with score ≈ 2.6. If the top hit looks
+right, the retriever is wired correctly.
 
-### B.4 Launch the TUI
+---
+
+## 6. Launch the TUI
 
 ```bash
 cd /files/company-rag-agent
 npm start
 ```
 
-`pi-tui` prompt appears. Type questions, Enter to send. `/quit` or Ctrl+C
-exits. Tool calls (`read`, `write`, `edit`, `bash`) prompt for permission
-before running — see `src/main.ts:30` for the auto-allow set
-(`search`, `open_document`, `read`).
+The `pi-tui` chat prompt appears. Type a question and press Enter.
 
-The TUI works in a Nuvolos VS Code terminal because that's a real raw-mode
-terminal.
+| Key / command | What it does |
+|---|---|
+| `Enter` | Send the question to the agent |
+| `Ctrl+C` or `/quit` | Exit |
+| `/reset` | Clear the conversation transcript |
 
----
+The agent has six tools: `search`, `open_document`, `read` (auto-allowed),
+plus `write`, `edit`, `bash` (each prompts you to allow once / always /
+deny on first use — see `src/main.ts:30`).
 
-## What the audit fixes changed (so you know what to expect)
-
-The push you're working from includes the audit-fix commit (`75a40ed`).
-Behavioral changes vs Andre's prior `Nuvolos` branch tip:
-
-1. **`add_document` / `edit_document` actually work now.** Before, every
-   call silently failed at the schema layer (INSERT into a `GENERATED
-   ALWAYS` column). If you tested the agent's "write a gmail" path before
-   and it appeared to succeed but search couldn't find the doc — that was
-   this bug.
-2. **All tool-surface tools (`bash`, `read`, `write`, `edit`) are off by
-   default.** They're opt-in via env vars. Without them, the agent can only
-   `search`, `open_document`, `add_document`, `edit_document` — which is
-   the full knowledge-base agentic loop and what the demo needs.
-3. **The /query, /stats, /document endpoints accept an optional
-   `Authorization: Bearer <AGENT_API_KEY>` header.** No env set = no auth =
-   prior open behavior. Setting the env enables auth across all three
-   endpoints simultaneously.
-4. **Score numbers in search results look different.** Old scale: 0–4 (top
-   hit ~2.6). New scale (RRF * 60): 0–2 (top hit ~1.5–1.9 for a strong
-   match). The system prompt has been updated to reflect this — if you see
-   the agent re-searching when scores look high, check the prompt has the
-   new heuristic ("Score >= 1.0 strong, >= 1.5 very strong").
-5. **Date filters now actually filter dates.** If you used `date_from` on
-   non-gmail queries before, it was a no-op; now it returns only chunks
-   with timestamps in range (which means mostly gmail and fireflies).
-6. **`/query` errors are sanitized.** If a tool fails, the LLM sees
-   `Tool error (TypeError)` instead of the raw exception. Full traceback
-   goes to the server log (`log.exception`). Set logging to DEBUG if you
-   need to chase one.
-
-If anything in the demo regresses vs. before the fixes, the most likely
-cause is one of:
-
-- Frontend not forwarding the bearer token (gets 401 on every /query)
-- Frontend reading old score thresholds from cached state
-- `BACKEND_URL` pointing at the wrong service hostname after a Nuvolos
-  workspace reprovision
+The TUI works in a Nuvolos VS Code terminal because that's a real
+raw-mode terminal. **Do not** try to run `npm start` over a tool wrapper
+that captures stdout — it needs the live TTY.
 
 ---
 
-## Quick troubleshooting
+## What to expect from latencies
+
+- **First query**: ~30 seconds. One-time model-load cost. Subsequent queries
+  stay warm because `OLLAMA_KEEP_ALIVE=-1` is set.
+- **Warm queries**: depends on the answer length. Pure retrieval (smoke
+  test) is ~2 seconds. A full agent turn (search + reason + answer) is
+  typically 5–30 seconds on Nuvolos GPU.
+- **Reasoning mode**: not exposed in the TS TUI (`src/main.ts:39` sets
+  `thinkingLevel: "off"`). To enable, change to `"high"` and rebuild.
+
+---
+
+## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| First query 30s+, then fast | Cold model load on first request | Expected. `OLLAMA_KEEP_ALIVE=-1` keeps it warm for subsequent calls. |
-| All queries 60s+ | Ollama model not on GPU, or daemon under load | `nvidia-smi` to check; `ollama ps` to confirm model is loaded. |
-| 401 from /query | `AGENT_API_KEY` set in backend but frontend doesn't send it | Set `BACKEND_API_KEY` env on Frontend app to the same value, restart `app.py`. |
-| 500 from /query | Check Backend logs for the actual exception | `log.exception` writes the full traceback server-side. |
-| Eval prints `FUSION_VERSION drift` | Eval and backend out of sync | Re-pull, both files have `FUSION_VERSION = "rrf-v1"` after audit fixes. |
-| `add_document` returns "Tool error" | DB schema doesn't match — likely an old index | Re-run `build_index_pg.py --rebuild` to drop & recreate schema. |
-| TS smoke test errors importing `tsx` | Run from project root, not parent | `cd /files/company-rag-agent && npx tsx src/rag/smoke.ts ...` |
+| `Error: model 'qwen3.5-9b-32k' not found` | Using Edoardo's upstream un-patched, or the Modelfile create step was skipped | Either (a) patch `src/model.ts:4-5` to `qwen3-8b-32k`, or (b) run `ollama create qwen3-8b-32k -f Modelfile`. Both. |
+| `Error: connect ECONNREFUSED 127.0.0.1:11434` | Ollama daemon not running | `ollama serve &` in the same shell (or a separate terminal) |
+| Smoke test returns no hits | Index not built or wrong path | `ls -lh data/index/rag.db` (should be ~318 MB); rebuild if missing |
+| First query takes 100+ seconds | Cold-load from `/space_mounts/pars` (~87 s LFS read + 47 s CUDA init) | Expected. Subsequent queries are fast thanks to `KEEP_ALIVE=-1`. If it stays slow, check `nvidia-smi` — model should occupy ~4.5 GiB VRAM. |
+| `npx tsx` says "Cannot find module …/src/rag/smoke.ts" | Running from parent dir | `cd /files/company-rag-agent` first |
+| TUI shows garbage characters / arrow keys don't work | Running through a terminal wrapper that doesn't pass raw input | Use the Nuvolos VS Code terminal directly, not a sub-shell |
 
 ---
 
-## Known not-fixed (deferred from audit)
+## Differences from Edoardo's local Mac/Linux setup
 
-The audit identified more findings than this push addresses. Deferred:
+Edoardo's README assumes macOS/Linux local dev. On Nuvolos:
 
-- **Second-order prompt injection via corpus documents.** A malicious doc
-  retrieved by `search` could try to instruct the model. Mitigation
-  requires either a defensive system prompt clause or wrapping retrieved
-  content in clear delimiters. Worth a follow-up; not blocking the demo.
-- **Corpus-wide BM25 IDF.** Current implementation derives IDF from the
-  24 returned rows per query. Fix requires precomputing corpus DF/avgdl
-  at startup (~30-60s warmup). Skipped this sprint because RRF replaces
-  the broken fusion math — BM25 absolute magnitude no longer affects fusion.
-- **Per-Gradio-session cancel state.** Stop button uses a module-global
-  `threading.Event`, so two concurrent users clobber each other's cancel
-  flag. Low priority unless the demo has multiple simultaneous testers.
-- **Connection pool.** Replaced with a single RLock for now; throughput
-  limited to ~1 concurrent DB op. Fine for course demo.
+- **Sudo is unavailable** → Ollama install is rootless (the `tar.zst` path
+  above), not the system installer Edoardo's README suggests.
+- **`/space_mounts/pars`** is shared LFS — use it for Ollama models so
+  they survive container restart and so teammates' instances can share
+  the same weights.
+- **GPU is available** — Tesla T4 with 14.6 GiB free VRAM. `qwen3:8b`
+  fully offloads (37/37 layers, ~4.5 GiB VRAM). Warm inference ≈ 4s for
+  short responses.
+- **Edoardo's model id (`qwen3.5-9b-32k`) doesn't exist on stock Ollama** —
+  your fork has Andre's fix to `qwen3-8b-32k`. If you ever rebase off
+  Edoardo's upstream `main`, re-apply this change to `src/model.ts:4-5`.
 
-See the audit transcript in the chat session for the full punch list.
+---
+
+## Not used here (but in the same repo)
+
+If anyone on the team wants to run **Andre's Python/Gradio/pgvector
+stack** instead of the TS TUI, see `README.md` section "Running on
+Nuvolos" — same Ollama install, but uses the **Database** Nuvolos app
+(pgvector) and starts FastAPI + Gradio across the Backend + Frontend
+apps. The audit-fix commit (`75a40ed`) on this branch added env-gated
+security flags to that stack — see commit message for details.
