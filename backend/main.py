@@ -40,10 +40,12 @@ import os
 import re
 import json
 import logging
+import secrets
 import subprocess
+import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 import httpx
@@ -51,7 +53,7 @@ import numpy as np
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -70,12 +72,18 @@ DB_PASSWORD = os.environ.get("PGPASSWORD", "nuvolos")
 DB_NAME     = os.environ.get("PGDATABASE", "nuvolos")
 
 TOP_K_PER_BRANCH = 8
-VEC_WEIGHT       = 0.7
-KW_WEIGHT        = 0.3
-SCORE_THRESHOLD  = 0.35
-SCORE_SCALE      = 4.0
-BM25_K1          = 1.5
-BM25_B           = 0.75
+# Reciprocal Rank Fusion (RRF) replaces the prior weighted-sum that gave the
+# vector branch a ~5x scale advantage. RRF_K=60 is the standard TREC default.
+# Displayed score = raw_rrf * RRF_DISPLAY_SCALE so the prompt heuristic stays
+# in a human-friendly range — a top-of-one-branch hit ≈ 1.0, top-of-both ≈ 1.97.
+RRF_K              = 60
+RRF_DISPLAY_SCALE  = 60.0
+SCORE_THRESHOLD    = 0.5      # on the displayed scale (raw ≈ 0.0083)
+BM25_K1            = 1.5
+BM25_B             = 0.75
+# Tracks the fusion algorithm version so the eval harness can assert parity
+# with the production retriever (see indexing/eval_retrieval_pg.py).
+FUSION_VERSION     = "rrf-v1"
 MAX_AGENT_TURNS  = 6
 MAX_HISTORY_TURNS = 10   # keep last N conversation turns; bounds context growth
 MAX_NEW_TOKENS   = 2048
@@ -94,13 +102,63 @@ BASH_DENY = [
     r"\breboot\b",
 ]
 
+# Security gates (opt-in by env). Defaults: read-only filesystem, no bash, no
+# host writes — safe for Nuvolos proxy URLs which are reachable by anyone with
+# the link. Set ENABLE_*=1 in the Backend app CONFIGURE to opt in.
+ENABLE_BASH_TOOL      = os.environ.get("ENABLE_BASH_TOOL",      "0") == "1"
+ENABLE_FS_WRITE_TOOLS = os.environ.get("ENABLE_FS_WRITE_TOOLS", "0") == "1"
+ENABLE_FS_READ_TOOL   = os.environ.get("ENABLE_FS_READ_TOOL",   "1") == "1"
+AGENT_FS_ROOT         = os.path.realpath(os.path.expanduser(
+    os.environ.get("AGENT_FS_ROOT", os.getcwd())
+))
+AGENT_API_KEY         = os.environ.get("AGENT_API_KEY", "").strip()
+LLM_TIMEOUT_SEC       = float(os.environ.get("LLM_TIMEOUT_SEC", "60"))
+
 # Matches Qwen3 <think>…</think> blocks (enabled when the model reasons aloud)
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 # ── Global singletons ──────────────────────────────────────────────────────────
 llm_client: Optional[OpenAI] = None
 db_conn = None
-db_cur  = None
+# RLock (reentrant) so db_edit_document → fetch_document → cursor re-entry works
+# without deadlocking. Per the audit, the prior shared global cursor was a
+# correctness bug under FastAPI's threadpool; we now open a short-lived cursor
+# per call inside this lock. Throughput limited to ≈ 1 concurrent DB op, which
+# is correct for the 1-3 user course-demo workload.
+db_lock = threading.RLock()
+
+
+@contextmanager
+def db_cursor():
+    """Short-lived autocommit cursor, serialized via db_lock."""
+    with db_lock:
+        with db_conn.cursor() as cur:
+            yield cur
+
+
+@contextmanager
+def db_write_txn():
+    """Explicit transaction for multi-statement writes. Rolls back on any error
+    so add_document / edit_document never leave the DB in a half-updated state.
+    Autocommit is temporarily disabled inside the lock and restored on exit."""
+    with db_lock:
+        db_conn.autocommit = False
+        cur = db_conn.cursor()
+        try:
+            yield cur
+            db_conn.commit()
+        except Exception:
+            try:
+                db_conn.rollback()
+            except Exception:
+                log.exception("rollback failed")
+            raise
+        finally:
+            cur.close()
+            try:
+                db_conn.autocommit = True
+            except Exception:
+                log.exception("could not restore autocommit")
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
@@ -121,7 +179,9 @@ Primary workflow:
    - participant: when the user mentions a specific person.
 2. Look at the top results. If the highest-scoring hit's preview clearly addresses
    the question, call `open_document` on its doc_id and answer from the full text.
-   Score >= 2.0 is almost always a strong match — do not keep re-searching.
+   Score >= 1.0 means the chunk ranked at the top of at least one retrieval branch
+   (vector or keyword) — almost always a strong match. Score >= 1.5 means it ranked
+   highly in both branches (very strong). Do not keep re-searching above 1.0.
 3. Only call `search` a SECOND time if (a) the opened document is clearly off-topic,
    or (b) you need a different piece of information from a different source.
    Never run more than 3 searches total for one question.
@@ -154,7 +214,9 @@ paraphrasing when accuracy matters.
 """
 
 # ── Tool definitions ───────────────────────────────────────────────────────────
-TOOLS = [
+# The full menu — security gates filter this list below before exposing to the
+# LLM. `bash`, `read`, `write`, `edit` are all opt-in via ENABLE_* env vars.
+_ALL_TOOLS = [
     {
         "type": "function",
         "function": {
@@ -332,33 +394,70 @@ TOOLS = [
     },
 ]
 
+# Apply security gates: filesystem/bash tools are off by default. Filter the
+# advertised TOOLS list so the LLM never sees disabled tools — keeps the
+# context window cleaner and removes the temptation entirely.
+_GATE_BY_TOOL = {
+    "bash":  ENABLE_BASH_TOOL,
+    "read":  ENABLE_FS_READ_TOOL,
+    "write": ENABLE_FS_WRITE_TOOLS,
+    "edit":  ENABLE_FS_WRITE_TOOLS,
+}
+TOOLS = [t for t in _ALL_TOOLS if _GATE_BY_TOOL.get(t["function"]["name"], True)]
+
+
+# ── Bearer-token auth (optional) ──────────────────────────────────────────────
+def require_api_key(authorization: str | None = Header(None)):
+    """If AGENT_API_KEY is set, require `Authorization: Bearer <key>` on
+    protected endpoints. If unset, all endpoints are open (default — matches
+    prior behavior; backwards-compatible). Uses constant-time compare."""
+    if not AGENT_API_KEY:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    token = authorization.split(" ", 1)[1].strip()
+    if not secrets.compare_digest(token, AGENT_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global llm_client, db_conn, db_cur
+    global llm_client, db_conn
 
     log.info(f"Connecting to pgvector @ {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    kwargs: dict = dict(host=DB_HOST, port=DB_PORT, user=DB_USER, dbname=DB_NAME)
+    kwargs: dict = dict(host=DB_HOST, port=DB_PORT, user=DB_USER, dbname=DB_NAME,
+                        connect_timeout=10)
     if DB_PASSWORD:
         kwargs["password"] = DB_PASSWORD
     db_conn = psycopg2.connect(**kwargs)
     db_conn.autocommit = True
     register_vector(db_conn)
-    db_cur = db_conn.cursor()
-    db_cur.execute("SET ivfflat.probes = 10;")  # improves ANN recall (default=1)
-    db_cur.execute(f"SELECT COUNT(*) FROM {TABLE_CHUNKS};")
-    n_chunks = db_cur.fetchone()[0]
+    with db_conn.cursor() as cur:
+        cur.execute("SET ivfflat.probes = 10;")  # improves ANN recall (default=1)
+        cur.execute(f"SELECT COUNT(*) FROM {TABLE_CHUNKS};")
+        n_chunks = cur.fetchone()[0]
     log.info(f"pgvector connected — {n_chunks} chunks indexed.")
 
-    log.info(f"LLM: {OLLAMA_HOST}  model={LLM_MODEL}  embed={EMBED_MODEL}")
-    llm_client = OpenAI(base_url=f"{OLLAMA_HOST}/v1", api_key="ollama")
+    log.info(f"LLM: {OLLAMA_HOST}  model={LLM_MODEL}  embed={EMBED_MODEL}  "
+             f"timeout={LLM_TIMEOUT_SEC}s")
+    llm_client = OpenAI(
+        base_url=f"{OLLAMA_HOST}/v1",
+        api_key="ollama",
+        timeout=LLM_TIMEOUT_SEC,
+    )
+    log.info(f"Tools enabled: bash={ENABLE_BASH_TOOL} fs_read={ENABLE_FS_READ_TOOL} "
+             f"fs_write={ENABLE_FS_WRITE_TOOLS} fs_root={AGENT_FS_ROOT}")
+    log.info(f"Auth: {'bearer-token' if AGENT_API_KEY else 'disabled (open access)'}")
     log.info("Application startup complete.")
 
     yield
 
     if db_conn:
-        db_conn.close()
+        try:
+            db_conn.close()
+        except Exception:
+            log.exception("db close failed during shutdown")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -418,15 +517,21 @@ def _embed(text: str) -> list[float]:
 
 
 # ── BM25 keyword scoring ───────────────────────────────────────────────────────
+# Token pattern accepts alphanumeric — queries like "Q3 2025" or "ticket 4521"
+# keep their distinctive numeric tokens. Audit found the prior alpha-only regex
+# silently dropped these for a corpus with many ticket IDs and dates.
+_TOKEN_RE = re.compile(r'[a-zA-Z0-9]\w*')
+
+
 def _fts_or_query(q: str) -> str | None:
-    """Strip non-alpha chars and OR-join words for a PostgreSQL tsquery.
+    """Tokenize and OR-join words for a PostgreSQL tsquery.
     Mirrors src/rag/fusion.ts ftsQuery: any-word matching for maximum recall."""
-    words = [w for w in re.findall(r'[a-zA-Z]\w*', q.lower()) if len(w) > 1]
+    words = [w for w in _TOKEN_RE.findall(q.lower()) if len(w) > 1]
     return " | ".join(words) if words else None
 
 
 def _tokenize(text: str) -> list[str]:
-    return [w for w in re.findall(r'[a-zA-Z]\w*', text.lower()) if len(w) > 1]
+    return [w for w in _TOKEN_RE.findall(text.lower()) if len(w) > 1]
 
 
 def _bm25_scores(query_terms: list[str], candidates: list[tuple[int, str]]) -> dict[int, float]:
@@ -474,11 +579,14 @@ def _build_filters(
         ph = ",".join(["%s"] * len(source_types))
         clauses.append(f"source_type IN ({ph})")
         params.extend(source_types)
+    # Date filters apply only to chunks with timestamps set (effectively gmail
+    # per chunkers.py). Prior behavior `ts_to IS NULL OR ...` let every
+    # non-dated chunk through, making the date filter a near no-op.
     if date_from:
-        clauses.append("(ts_to IS NULL OR ts_to >= %s)")
+        clauses.append("(ts_to IS NOT NULL AND ts_to >= %s)")
         params.append(date_from)
     if date_to:
-        clauses.append("(ts_from IS NULL OR ts_from <= %s)")
+        clauses.append("(ts_from IS NOT NULL AND ts_from <= %s)")
         params.append(date_to)
     if participant:
         clauses.append("participants_json LIKE %s")
@@ -494,75 +602,100 @@ def rag_search(
     participant: str | None = None,
     top_n: int = 6,
 ) -> list[dict]:
+    """Hybrid retrieval: vector ANN + BM25 keyword, fused via Reciprocal Rank
+    Fusion (RRF). Per-branch ranks are combined as 1/(RRF_K+rank); the prior
+    weighted-sum had the vector score on a ~5x larger scale than keyword.
+
+    Eval parity: indexing/eval_retrieval_pg.py uses the same FUSION_VERSION.
+    """
     top_n = max(1, min(20, top_n))
     qvec = _embed(query)
     filter_clauses, filter_params = _build_filters(source_types, date_from, date_to, participant)
-    base_where = ("WHERE " + " AND ".join(filter_clauses)) if filter_clauses else ""
 
-    # Vector branch
-    db_cur.execute(
-        f"""SELECT chunk_id, doc_id, source_type, text, ts_from, ts_to,
-                   (embedding <=> %s::vector) AS dist
-            FROM   {TABLE_CHUNKS} {base_where}
-            ORDER  BY dist ASC LIMIT %s""",
-        [qvec] + filter_params + [TOP_K_PER_BRANCH],
-    )
-    vec_scores: dict[int, tuple] = {}
-    for chunk_id, doc_id, source_type, text, ts_from, ts_to, dist in db_cur.fetchall():
-        vec_scores[chunk_id] = (doc_id, source_type, text, ts_from, ts_to, (1.0 - float(dist)) * SCORE_SCALE)
+    # Vector branch — produces ranked (chunk_id, row_data) list
+    vec_clauses = filter_clauses + ["embedding IS NOT NULL"]
+    vec_where = "WHERE " + " AND ".join(vec_clauses)
+    vec_rows: list[tuple] = []
+    with db_cursor() as cur:
+        cur.execute(
+            f"""SELECT chunk_id, doc_id, source_type, text, ts_from, ts_to,
+                       (embedding <=> %s::vector) AS dist
+                FROM   {TABLE_CHUNKS} {vec_where}
+                ORDER  BY dist ASC LIMIT %s""",
+            [qvec] + filter_params + [TOP_K_PER_BRANCH],
+        )
+        vec_rows = cur.fetchall()
 
-    # Keyword branch — OR-joined FTS candidates, reranked by BM25 in Python.
-    # Mirrors src/rag/fusion.ts: ftsQuery OR-joins words for recall, BM25 for ranking.
-    kw_scores: dict[int, tuple] = {}
+    # vec_data[cid] -> (doc_id, source_type, text, ts_from, ts_to); vec_rank[cid] -> 1-based rank
+    vec_data: dict[int, tuple] = {}
+    vec_rank: dict[int, int] = {}
+    for rank, (chunk_id, doc_id, source_type, text, ts_from, ts_to, _dist) in enumerate(vec_rows, 1):
+        vec_data[chunk_id] = (doc_id, source_type, text, ts_from, ts_to)
+        vec_rank[chunk_id] = rank
+
+    # Keyword branch — pre-rank by ts_rank in SQL to get a meaningful 24-row
+    # sample, then Python BM25 rerank to TOP_K_PER_BRANCH.
+    kw_data: dict[int, tuple] = {}
+    kw_rank: dict[int, int] = {}
     fts_q = _fts_or_query(query)
     if fts_q:
         try:
-            kw_conditions = filter_clauses + ["text_tsv @@ to_tsquery('english', %s)"]
-            kw_where = "WHERE " + " AND ".join(kw_conditions)
-            db_cur.execute(
-                f"""SELECT chunk_id, doc_id, source_type, text, ts_from, ts_to
-                    FROM   {TABLE_CHUNKS} {kw_where}
-                    LIMIT  %s""",
-                filter_params + [fts_q, TOP_K_PER_BRANCH * 3],
-            )
-            rows = db_cur.fetchall()
+            kw_clauses = filter_clauses + ["text_tsv @@ to_tsquery('english', %s)"]
+            kw_where = "WHERE " + " AND ".join(kw_clauses)
+            with db_cursor() as cur:
+                cur.execute(
+                    f"""SELECT chunk_id, doc_id, source_type, text, ts_from, ts_to
+                        FROM   {TABLE_CHUNKS} {kw_where}
+                        ORDER  BY ts_rank(text_tsv, to_tsquery('english', %s)) DESC
+                        LIMIT  %s""",
+                    filter_params + [fts_q, fts_q, TOP_K_PER_BRANCH * 3],
+                )
+                kw_rows = cur.fetchall()
             query_terms = _tokenize(query)
-            bm25 = _bm25_scores(query_terms, [(r[0], r[3]) for r in rows])
-            ranked = sorted(rows, key=lambda r: bm25.get(r[0], 0.0), reverse=True)[:TOP_K_PER_BRANCH]
+            bm25 = _bm25_scores(query_terms, [(r[0], r[3]) for r in kw_rows])
+            ranked = sorted(kw_rows, key=lambda r: bm25.get(r[0], 0.0), reverse=True)[:TOP_K_PER_BRANCH]
             for rank, (chunk_id, doc_id, source_type, text, ts_from, ts_to) in enumerate(ranked, 1):
-                kw_scores[chunk_id] = (doc_id, source_type, text, ts_from, ts_to,
-                                       (1 / (1 + rank)) * SCORE_SCALE)
+                kw_data[chunk_id] = (doc_id, source_type, text, ts_from, ts_to)
+                kw_rank[chunk_id] = rank
         except Exception as e:
             log.warning(f"Keyword branch failed (vector-only fallback): {e}")
-            db_conn.autocommit = True
 
-    all_chunk_ids = set(vec_scores) | set(kw_scores)
+    all_chunk_ids = set(vec_data) | set(kw_data)
     if not all_chunk_ids:
         return []
 
-    all_doc_ids = list({d[0] for d in list(vec_scores.values()) + list(kw_scores.values())})
+    # Fetch titles for the union of doc_ids
+    all_doc_ids = list({(vec_data.get(cid) or kw_data[cid])[0] for cid in all_chunk_ids})
     ph = ",".join(["%s"] * len(all_doc_ids))
-    db_cur.execute(f"SELECT doc_id, title FROM {TABLE_DOCS} WHERE doc_id IN ({ph})", all_doc_ids)
-    titles: dict[str, str | None] = {row[0]: row[1] for row in db_cur.fetchall()}
+    with db_cursor() as cur:
+        cur.execute(f"SELECT doc_id, title FROM {TABLE_DOCS} WHERE doc_id IN ({ph})", all_doc_ids)
+        titles: dict[str, str | None] = {row[0]: row[1] for row in cur.fetchall()}
+    missing = set(all_doc_ids) - set(titles)
+    if missing:
+        log.warning(f"Missing titles for doc_ids: {sorted(missing)[:5]}{' …' if len(missing)>5 else ''}")
 
+    # RRF fusion
     fused: list[dict] = []
     for cid in all_chunk_ids:
-        vec_d = vec_scores.get(cid)
-        kw_d  = kw_scores.get(cid)
-        data  = vec_d or kw_d
-        vec   = vec_d[5] if vec_d else 0.0
-        kw    = kw_d[5]  if kw_d  else 0.0
-        final = VEC_WEIGHT * vec + KW_WEIGHT * kw
-        if final < SCORE_THRESHOLD:
+        data = vec_data.get(cid) or kw_data[cid]
+        vr = vec_rank.get(cid)
+        kr = kw_rank.get(cid)
+        rrf_raw = 0.0
+        if vr is not None:
+            rrf_raw += 1.0 / (RRF_K + vr)
+        if kr is not None:
+            rrf_raw += 1.0 / (RRF_K + kr)
+        score = rrf_raw * RRF_DISPLAY_SCALE
+        if score < SCORE_THRESHOLD:
             continue
         fused.append({
             "chunk_id":    cid,
             "doc_id":      data[0],
             "source_type": data[1],
             "title":       titles.get(data[0]),
-            "score":       round(final, 3),
-            "vec_score":   round(vec, 3),
-            "kw_score":    round(kw, 3),
+            "score":       round(score, 3),
+            "vec_rank":    vr,
+            "kw_rank":     kr,
             "preview":     data[2][:320].replace("\n", " ").strip(),
             "ts_from":     data[3],
             "ts_to":       data[4],
@@ -573,15 +706,12 @@ def rag_search(
 
 
 def fetch_document(doc_id: str) -> dict | None:
-    cur = db_conn.cursor()
-    try:
+    with db_cursor() as cur:
         cur.execute(
             f"SELECT doc_id, source_type, title, content FROM {TABLE_DOCS} WHERE doc_id = %s",
             (doc_id,),
         )
         row = cur.fetchone()
-    finally:
-        cur.close()
     if not row:
         return None
     return {"doc_id": row[0], "source_type": row[1], "title": row[2], "content": row[3]}
@@ -607,6 +737,10 @@ def _simple_chunk(text: str, chunk_size: int = 2000, overlap: int = 200) -> list
 
 def _insert_chunks(cur, doc_id: str, source_type: str, title: str, content: str,
                    participants: str | None, ts_from: str | None, ts_to: str | None):
+    """Insert chunked, embedded rows. `text_tsv` is a GENERATED ALWAYS column
+    (see indexing/schema_pg.sql) — Postgres populates it automatically from
+    `text`. Writing to it directly raises 'cannot insert into column' and
+    every add_document / edit_document silently failed before this fix."""
     participants_json = (
         json.dumps([p.strip() for p in participants.split(",")]) if participants else "[]"
     )
@@ -621,25 +755,27 @@ def _insert_chunks(cur, doc_id: str, source_type: str, title: str, content: str,
         embedding = _embed(full_text)
         cur.execute(
             f"""INSERT INTO {TABLE_CHUNKS}
-                (doc_id, source_type, text, ts_from, ts_to, participants_json, embedding, text_tsv)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::vector, to_tsvector('english', %s))""",
-            (doc_id, source_type, full_text, ts_from, ts_to, participants_json, embedding, full_text),
+                (doc_id, source_type, text, ts_from, ts_to, participants_json, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::vector)""",
+            (doc_id, source_type, full_text, ts_from, ts_to, participants_json, embedding),
         )
 
 
 def db_add_document(source_type: str, title: str, content: str,
                     participants: str | None = None, date: str | None = None) -> str:
+    if not (content and content.strip()):
+        raise ValueError("Document content must not be empty.")
     doc_id = _new_doc_id()
     ts = date or None
-    cur = db_conn.cursor()
-    try:
+    # Wrap doc-row INSERT and per-chunk inserts in one transaction so a
+    # mid-batch _embed failure rolls back to no doc + no chunks, rather than
+    # leaving an orphan doc row (the prior bug, hidden by autocommit=True).
+    with db_write_txn() as cur:
         cur.execute(
             f"INSERT INTO {TABLE_DOCS} (doc_id, source_type, title, content) VALUES (%s, %s, %s, %s)",
             (doc_id, source_type, title, content),
         )
         _insert_chunks(cur, doc_id, source_type, title, content, participants, ts, ts)
-    finally:
-        cur.close()
     return doc_id
 
 
@@ -659,19 +795,51 @@ def db_edit_document(doc_id: str, new_content: str | None = None,
         updated = doc["content"].replace(old_string, new_string, 1)
     else:
         return "Provide either new_content or both old_string and new_string."
-    cur = db_conn.cursor()
-    try:
+    if not updated.strip():
+        return "Refusing to write empty content."
+    # Same transactional guarantee as add: UPDATE → DELETE old chunks → INSERT
+    # new chunks all happen together or not at all.
+    with db_write_txn() as cur:
         cur.execute(f"UPDATE {TABLE_DOCS} SET content = %s WHERE doc_id = %s", (updated, doc_id))
         cur.execute(f"DELETE FROM {TABLE_CHUNKS} WHERE doc_id = %s", (doc_id,))
-        _insert_chunks(cur, doc_id, doc["source_type"], doc["title"] or "", updated, None, None, None)
-    finally:
-        cur.close()
+        _insert_chunks(cur, doc_id, doc["source_type"], doc["title"] or "",
+                       updated, None, None, None)
     return f"Updated {doc_id} and re-indexed."
+
+
+# ── Filesystem sandbox ────────────────────────────────────────────────────────
+def _safe_path(path: str) -> str:
+    """Resolve and validate that `path` lives under AGENT_FS_ROOT.
+    `realpath` resolves symlinks, so a symlink inside the sandbox pointing
+    outside resolves to its true target and is rejected. Raises
+    PermissionError on escape; raise text is intentionally generic to avoid
+    leaking the sandbox root to the LLM (full path is logged server-side)."""
+    if not path or "\x00" in path:
+        raise PermissionError("Invalid path")
+    expanded = os.path.realpath(os.path.expanduser(path))
+    if expanded != AGENT_FS_ROOT and not expanded.startswith(AGENT_FS_ROOT + os.sep):
+        log.warning(f"sandbox escape blocked: {path!r} -> {expanded}")
+        raise PermissionError("Path not permitted by sandbox policy")
+    return expanded
+
+
+_DISABLED_TOOLS = {
+    "bash":  not ENABLE_BASH_TOOL,
+    "read":  not ENABLE_FS_READ_TOOL,
+    "write": not ENABLE_FS_WRITE_TOOLS,
+    "edit":  not ENABLE_FS_WRITE_TOOLS,
+}
 
 
 # ── Tool execution ─────────────────────────────────────────────────────────────
 def execute_tool(name: str, args: dict) -> tuple[str, list[dict]]:
     """Returns (text_for_llm, search_hits_for_sources)."""
+
+    # Belt-and-suspenders: even if a disabled tool was somehow registered or
+    # replayed from history, refuse it here.
+    if _DISABLED_TOOLS.get(name):
+        return (f"Tool '{name}' is disabled on this deployment. "
+                f"Set the corresponding ENABLE_* env var to enable."), []
 
     if name == "search":
         hits = rag_search(
@@ -694,9 +862,12 @@ def execute_tool(name: str, args: dict) -> tuple[str, list[dict]]:
                 time_str = f" [{ts_from}]"
             else:
                 time_str = ""
+            vr = h.get("vec_rank")
+            kr = h.get("kw_rank")
+            rank_str = f"vec_rank={vr if vr is not None else '-'} kw_rank={kr if kr is not None else '-'}"
             lines.append(
                 f"#{h['chunk_id']} (doc={h['doc_id']}, source={h['source_type']}{time_str}, "
-                f"score={h['score']} vec={h['vec_score']} kw={h['kw_score']})\n"
+                f"score={h['score']} {rank_str})\n"
                 f"title: {h['title'] or ''}\npreview: {h['preview']}"
             )
         return "\n\n".join(lines), hits
@@ -711,8 +882,8 @@ def execute_tool(name: str, args: dict) -> tuple[str, list[dict]]:
             "source_type": doc["source_type"],
             "title": doc["title"],
             "score": 0.0,
-            "vec_score": 0.0,
-            "kw_score": 0.0,
+            "vec_rank": None,
+            "kw_rank": None,
             "preview": doc["content"][:320].replace("\n", " ").strip(),
             "ts_from": None,
             "ts_to": None,
@@ -734,7 +905,7 @@ def execute_tool(name: str, args: dict) -> tuple[str, list[dict]]:
         source_hit = {
             "chunk_id": -1, "doc_id": doc_id,
             "source_type": args["source_type"], "title": args["title"],
-            "score": 0.0, "vec_score": 0.0, "kw_score": 0.0,
+            "score": 0.0, "vec_rank": None, "kw_rank": None,
             "preview": args["content"][:320].replace("\n", " ").strip(),
             "ts_from": args.get("date"), "ts_to": args.get("date"), "opened": True,
         }
@@ -756,47 +927,56 @@ def execute_tool(name: str, args: dict) -> tuple[str, list[dict]]:
             "chunk_id": -1, "doc_id": args["doc_id"],
             "source_type": doc["source_type"] if doc else "",
             "title": doc["title"] if doc else args["doc_id"],
-            "score": 0.0, "vec_score": 0.0, "kw_score": 0.0,
+            "score": 0.0, "vec_rank": None, "kw_rank": None,
             "preview": (doc["content"][:320].replace("\n", " ").strip()) if doc else "",
             "ts_from": None, "ts_to": None, "opened": True,
         }
         return result + f" Include {args['doc_id']} in your answer.", [source_hit]
 
     if name == "read":
-        path = os.path.expanduser(args["path"])
+        path = _safe_path(args["path"])
         with open(path, "r", encoding="utf-8") as f:
             return f.read(), []
 
     if name == "write":
-        path = os.path.expanduser(args["path"])
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        path = _safe_path(args["path"])
+        # Sandbox-resolved path is guaranteed to live under AGENT_FS_ROOT before
+        # we create any parent directories — prior code makedirs'd first, which
+        # was itself a sandbox-escape primitive (mkdir -p /etc/cron.d/...).
+        os.makedirs(os.path.dirname(path) or path, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(args["content"])
-        return f"Wrote {len(args['content'])} bytes to {path}", []
+        return f"Wrote {len(args['content'])} bytes to {os.path.basename(path)}", []
 
     if name == "edit":
-        path = os.path.expanduser(args["path"])
+        path = _safe_path(args["path"])
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
         old_s, new_s = args["old_string"], args["new_string"]
         count = text.count(old_s)
         if count == 0:
-            return f"Error: old_string not found in {path}", []
+            return f"Error: old_string not found in {os.path.basename(path)}", []
         if count > 1:
-            return f"Error: old_string appears {count} times in {path} — make it more specific", []
+            return f"Error: old_string appears {count} times — make it more specific", []
         with open(path, "w", encoding="utf-8") as f:
             f.write(text.replace(old_s, new_s, 1))
-        return f"Edited {path}", []
+        return f"Edited {os.path.basename(path)}", []
 
     if name == "bash":
+        # ENABLE_BASH_TOOL must be opt-in. The BASH_DENY regex denylist is
+        # known-bypassable (\rm -rf /, base64-decode-then-exec, etc.); treat
+        # enabling this tool as conferring full RCE in the container.
         command = args["command"]
         for pattern in BASH_DENY:
             if re.search(pattern, command):
                 return f"Refused: command matches deny pattern '{pattern}'. Run it manually if needed.", []
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=60, executable="/bin/bash",
-        )
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=60, executable="/bin/bash",
+            )
+        except subprocess.TimeoutExpired:
+            return "Tool error: bash command timed out after 60 seconds", []
         output = f"exit={result.returncode}\n--- stdout ---\n{result.stdout}"
         if result.stderr:
             output += f"\n--- stderr ---\n{result.stderr}"
@@ -904,7 +1084,7 @@ def run_agent(
                 answer = thinking_steps[-1]
             elif not answer:
                 answer = "The model did not produce an answer. Please try again."
-            return answer, all_sources, traces, thinking_steps
+            return answer, all_sources, traces, thinking_steps  # noqa
 
         # Capture inter-turn reasoning text (what the model says before calling tools)
         if visible_content.strip():
@@ -921,14 +1101,32 @@ def run_agent(
         })
 
         for tc in msg.tool_calls:
-            args_parsed = json.loads(tc.function.arguments)
+            args_parsed: dict = {}
             try:
+                # json.loads is INSIDE the try so a malformed tool-call
+                # argument (qwen3 thinking mode occasionally emits these) is
+                # surfaced to the model as a tool error rather than crashing
+                # the request. Also guarantees we still append a tool message
+                # with this tc.id, so Ollama's tool_call/tool_result pairing
+                # contract holds and the next agent turn doesn't 400.
+                args_parsed = json.loads(tc.function.arguments)
                 result_text, hits = execute_tool(tc.function.name, args_parsed)
                 all_sources.extend(hits)
                 summary = _trace_result(tc.function.name, result_text, hits)
+            except PermissionError:
+                # Sandbox / auth rejection — generic message, full path is
+                # logged inside _safe_path; don't echo paths into the LLM.
+                result_text = "Tool error: operation not permitted by sandbox policy"
+                summary = "error: not permitted"
+            except json.JSONDecodeError as e:
+                result_text = f"Tool error: invalid JSON arguments ({e})"
+                summary = "error: malformed args"
             except Exception as e:
-                result_text = f"Tool error: {e}"
-                summary = f"error: {str(e)[:50]}"
+                log.exception("tool '%s' failed", tc.function.name)
+                # Surface the exception class only — full traceback logged
+                # server-side; raw exception message could leak host paths.
+                result_text = f"Tool error ({type(e).__name__})"
+                summary = f"error: {type(e).__name__}"
             traces.append(
                 f"[{tc.function.name}] {_trace_args(tc.function.name, args_parsed)} → {summary}"
             )
@@ -938,26 +1136,37 @@ def run_agent(
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
+# /health stays open (no auth) so the Frontend's startup probe can detect
+# backend readiness even before the user has the API key. Everything else
+# accepts an optional bearer token via require_api_key.
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": LLM_MODEL, "embed": EMBED_MODEL, "ollama": OLLAMA_HOST}
+    return {
+        "status": "ok",
+        "model": LLM_MODEL,
+        "embed": EMBED_MODEL,
+        "ollama": OLLAMA_HOST,
+        "auth": "required" if AGENT_API_KEY else "disabled",
+        "fusion_version": FUSION_VERSION,
+    }
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(require_api_key)])
 def stats():
-    db_cur.execute(f"SELECT COUNT(*) FROM {TABLE_CHUNKS};")
-    n_chunks = db_cur.fetchone()[0]
-    db_cur.execute(f"SELECT COUNT(*) FROM {TABLE_DOCS};")
-    n_docs = db_cur.fetchone()[0]
-    db_cur.execute(
-        f"SELECT source_type, COUNT(*) FROM {TABLE_CHUNKS} "
-        f"GROUP BY source_type ORDER BY COUNT(*) DESC;"
-    )
-    return {"chunks": n_chunks, "documents": n_docs,
-            "by_source": {r[0]: r[1] for r in db_cur.fetchall()}}
+    with db_cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {TABLE_CHUNKS};")
+        n_chunks = cur.fetchone()[0]
+        cur.execute(f"SELECT COUNT(*) FROM {TABLE_DOCS};")
+        n_docs = cur.fetchone()[0]
+        cur.execute(
+            f"SELECT source_type, COUNT(*) FROM {TABLE_CHUNKS} "
+            f"GROUP BY source_type ORDER BY COUNT(*) DESC;"
+        )
+        by_source = {r[0]: r[1] for r in cur.fetchall()}
+    return {"chunks": n_chunks, "documents": n_docs, "by_source": by_source}
 
 
-@app.get("/document/{doc_id}")
+@app.get("/document/{doc_id}", dependencies=[Depends(require_api_key)])
 def get_document(doc_id: str):
     doc = fetch_document(doc_id)
     if not doc:
@@ -965,7 +1174,8 @@ def get_document(doc_id: str):
     return doc
 
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/query", response_model=QueryResponse,
+          dependencies=[Depends(require_api_key)])
 def query(req: QueryRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
@@ -973,12 +1183,16 @@ def query(req: QueryRequest):
     answer, raw_sources, traces, thinking = run_agent(req.question, req.history, req.thinking_mode)
     latency = round((time.perf_counter() - t0) * 1000, 1)
 
-    # Keep best search hit per doc_id; opened documents are always included
+    # Keep best search hit per doc_id; opened documents are always included.
+    # Guard the elif with `not opened` — otherwise a later search that returns
+    # the same doc_id with score > 0 would clobber the opened=True flag.
     best: dict[str, dict] = {}
     for s in raw_sources:
         if s.get("opened"):
             best[s["doc_id"]] = s          # opened always wins — it was actually read
-        elif s["doc_id"] not in best or s["score"] > best[s["doc_id"]]["score"]:
+        elif (s["doc_id"] not in best
+              or (not best[s["doc_id"]].get("opened")
+                  and s["score"] > best[s["doc_id"]]["score"])):
             best[s["doc_id"]] = s
 
     # Opened docs first, then search hits sorted by score descending
