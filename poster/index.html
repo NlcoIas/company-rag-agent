@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Skills-First RAG — UZH FS2026 Poster</title>
+
+<!--
+  A0 PORTRAIT POSTER (841mm × 1189mm)
+  Better Poster format (Morrison 2019). Single file, no external deps.
+
+  How to use:
+    Preview:  open this file in Chrome. The poster is mm-true.
+    Print:    Chrome → Ctrl-P → "Save as PDF" → Paper size: ISO A0
+              → Margins: None → Background graphics: ON → Save.
+    Edit:     all text is in semantic blocks below. CSS variables at
+              the top control the palette. Layout is CSS grid.
+
+  PLACEHOLDERS marked [[TBD ...]] — find with: grep "\[\[TBD" poster/index.html
+-->
+
+<style>
+  :root {
+    /* --- palette ----------------------------------------------- */
+    --ink: #111;
+    --muted: #444;
+    --paper: #ffffff;
+    --panel: #f4f4f0;
+    --rule: #d4d4cf;
+    --accent: #0028a5;   /* UZH blue */
+    --accent-2: #dc291e; /* UZH red, use sparingly */
+
+    /* --- typography (mm-true) --------------------------------- */
+    --t-body: 6.5mm;
+    --t-h: 11mm;
+    --t-eyebrow: 5mm;
+    --t-takeaway: 62mm;
+    --t-take-sub: 14mm;
+    --t-stat: 32mm;
+  }
+
+  /* Web font — Google Fonts Inter (cached after first load) */
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&family=Inter+Tight:wght@800;900&display=swap');
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #ddd;
+    font-family: 'Inter', system-ui, -apple-system, Segoe UI, sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* The poster itself: A0 portrait, mm-true */
+  .poster {
+    width: 841mm;
+    height: 1189mm;
+    background: var(--paper);
+    padding: 20mm;
+    margin: 20px auto;
+    box-shadow: 0 4px 30px rgba(0,0,0,.2);
+    display: grid;
+    grid-template-rows: 65mm 480mm 1fr 60mm;
+    gap: 10mm;
+  }
+
+  /* ------------------ HEADER ------------------ */
+  .header {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    border-bottom: 1.5mm solid var(--ink);
+    padding-bottom: 8mm;
+  }
+  .header h1 {
+    margin: 0;
+    font-family: 'Inter Tight', 'Inter', sans-serif;
+    font-weight: 900;
+    font-size: 22mm;
+    line-height: 1;
+    letter-spacing: -0.6mm;
+  }
+  .header .authors {
+    margin-top: 6mm;
+    font-size: var(--t-body);
+    color: var(--muted);
+  }
+  .header .authors b { color: var(--ink); }
+  .header .meta {
+    text-align: right;
+    font-size: var(--t-body);
+    color: var(--muted);
+  }
+  .header .meta .course {
+    font-weight: 700;
+    color: var(--ink);
+    font-size: 7mm;
+  }
+
+  /* ------------------ TAKEAWAY ------------------ */
+  .takeaway {
+    background: var(--accent);
+    color: #fff;
+    border-radius: 4mm;
+    padding: 40mm;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-start;
+  }
+  .takeaway .eyebrow {
+    font-size: var(--t-eyebrow);
+    font-weight: 700;
+    letter-spacing: 1mm;
+    text-transform: uppercase;
+    opacity: .8;
+    margin-bottom: 8mm;
+  }
+  .takeaway h2 {
+    margin: 0;
+    font-family: 'Inter Tight', 'Inter', sans-serif;
+    font-weight: 900;
+    font-size: var(--t-takeaway);
+    line-height: 0.95;
+    letter-spacing: -2mm;
+  }
+  .takeaway h2 .em { color: #ffd84a; }
+  .takeaway .sub {
+    margin-top: 16mm;
+    font-size: var(--t-take-sub);
+    line-height: 1.2;
+    font-weight: 500;
+    max-width: 700mm;
+  }
+
+  /* ------------------ MIDDLE GRID (4 panels) ------------------ */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 10mm;
+  }
+  .panel {
+    background: var(--panel);
+    border-radius: 3mm;
+    padding: 12mm 14mm;
+    display: flex;
+    flex-direction: column;
+  }
+  .panel .eyebrow {
+    font-size: var(--t-eyebrow);
+    font-weight: 700;
+    letter-spacing: 0.8mm;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 5mm;
+  }
+  .panel h3 {
+    margin: 0 0 7mm 0;
+    font-family: 'Inter Tight', 'Inter', sans-serif;
+    font-size: var(--t-h);
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: -0.3mm;
+  }
+  .panel p, .panel li {
+    font-size: var(--t-body);
+    line-height: 1.35;
+    margin: 0 0 4mm 0;
+  }
+  .panel ol, .panel ul { margin: 0 0 4mm 7mm; padding: 0; }
+  .panel ol li, .panel ul li { padding-left: 2mm; }
+  .panel ol li::marker { font-weight: 800; color: var(--accent); }
+
+  /* Stats row inside Measured panel */
+  .stats { display: flex; gap: 10mm; margin: 6mm 0; }
+  .stat { flex: 1; }
+  .stat .n {
+    font-family: 'Inter Tight', sans-serif;
+    font-weight: 900;
+    font-size: var(--t-stat);
+    line-height: 1;
+    color: var(--accent);
+    letter-spacing: -1mm;
+  }
+  .stat .l {
+    font-size: var(--t-eyebrow);
+    color: var(--muted);
+    margin-top: 1mm;
+    font-weight: 600;
+    letter-spacing: 0.3mm;
+    text-transform: uppercase;
+  }
+
+  /* Table for eval results */
+  table.eval {
+    border-collapse: collapse;
+    margin: 3mm 0 0 0;
+    font-size: var(--t-body);
+    width: 100%;
+  }
+  table.eval th, table.eval td {
+    padding: 1.5mm 3mm;
+    text-align: right;
+    border-bottom: 0.3mm solid var(--rule);
+  }
+  table.eval th:first-child, table.eval td:first-child { text-align: left; font-weight: 700; }
+  table.eval thead th { border-bottom: 0.6mm solid var(--ink); color: var(--muted); font-weight: 700; }
+  table.eval td.win { color: var(--accent); font-weight: 800; }
+
+  /* QR pseudo-box (real QR generated later) */
+  .qr-box {
+    width: 60mm; height: 60mm;
+    background: #fff;
+    border: 0.5mm solid var(--ink);
+    display: grid;
+    place-items: center;
+    font-size: 4mm;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+  .try-row { display: flex; gap: 10mm; align-items: center; }
+  .try-text { flex: 1; }
+
+  /* ------------------ ARCHITECTURE SVG ------------------ */
+  .arch { margin: 4mm 0 0 0; }
+  .arch svg { width: 100%; height: auto; display: block; }
+
+  /* ------------------ FOOTER ------------------ */
+  .footer {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    border-top: 1.5mm solid var(--ink);
+    padding-top: 6mm;
+    font-size: var(--t-eyebrow);
+    color: var(--muted);
+  }
+  .footer .repo { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .footer .ack { text-align: right; }
+
+  /* ------------------ PRINT ------------------ */
+  @page { size: 841mm 1189mm; margin: 0; }
+  @media print {
+    html, body { background: #fff; }
+    .poster { margin: 0; box-shadow: none; }
+  }
+
+  /* SVG component styles */
+  .arch text { font-family: 'Inter', sans-serif; font-size: 5mm; fill: var(--ink); }
+  .arch .box { fill: #fff; stroke: var(--ink); stroke-width: 0.4mm; }
+  .arch .box-accent { fill: var(--accent); stroke: var(--accent); }
+  .arch .box-accent text { fill: #fff; }
+  .arch .arrow { stroke: var(--ink); stroke-width: 0.4mm; fill: none; marker-end: url(#arrowhead); }
+  .arch .label { font-size: 4mm; fill: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="poster">
+
+  <!-- ====================== HEADER ====================== -->
+  <header class="header">
+    <div>
+      <h1>Skills‑First RAG for<br>Company Knowledge</h1>
+      <div class="authors">
+        <b>Nicolas Schaerer</b>, <b>Andre&nbsp;[[TBD lastname]]</b>, <b>Edoardo Schiatti</b>
+      </div>
+    </div>
+    <div class="meta">
+      <div class="course">UZH FS2026 — RAG Course</div>
+      <div>Group&nbsp;[[TBD group #]] · Poster session [[TBD date]]</div>
+    </div>
+  </header>
+
+  <!-- ====================== TAKEAWAY ====================== -->
+  <section class="takeaway">
+    <div class="eyebrow">Main finding</div>
+    <h2>Skills turn a generic RAG into a <span class="em">workflow agent</span>.</h2>
+    <p class="sub">
+      Three short prompts — <b>Trace</b>, <b>Decide</b>, <b>Onboard</b> — re-route
+      hybrid retrieval and reasoning into structured outputs the user can act on,
+      without changing the underlying retriever.
+    </p>
+  </section>
+
+  <!-- ====================== 2×2 GRID ====================== -->
+  <main class="grid">
+
+    <!-- ---------- WHY (top-left) ---------- -->
+    <section class="panel">
+      <div class="eyebrow">Why it matters</div>
+      <h3>Default RAG fails in&nbsp;3&nbsp;ways</h3>
+      <ol>
+        <li><b>Loses chronology.</b> Summarises the highest-scoring doc; drops the time dimension a user needs to trace an incident.</li>
+        <li><b>Loses outcomes.</b> Recaps the debate when asked "what did we decide" — the actual decision often lives in one later message.</li>
+        <li><b>Single-angle.</b> Onboarding questions need several searches (status, team, blockers); a default agent runs one and stops.</li>
+      </ol>
+      <p style="color: var(--muted); margin-top: auto;">
+        Better retrieval alone doesn't fix these — they're <i>workflow</i> failures.
+      </p>
+    </section>
+
+    <!-- ---------- HOW (top-right) ---------- -->
+    <section class="panel">
+      <div class="eyebrow">How it works</div>
+      <h3>Skill prompts steer the&nbsp;agent loop</h3>
+      <p>Each skill is a numbered workflow prepended to the user message at send time. The same hybrid retriever; new instructions on how to use it.</p>
+
+      <div class="arch">
+        <svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0,0 L10,5 L0,10 z" fill="#111"/>
+            </marker>
+          </defs>
+
+          <!-- Row: User → Skill → Agent → Hybrid → SQLite -->
+          <rect class="box" x="10" y="50" width="90" height="56" rx="4"/>
+          <text x="55" y="84" text-anchor="middle" style="font-weight:700">User</text>
+
+          <rect class="box box-accent" x="120" y="50" width="130" height="56" rx="4"/>
+          <text x="185" y="76" text-anchor="middle" style="font-weight:800">Skill prompt</text>
+          <text x="185" y="94" text-anchor="middle" style="font-size:4mm">prepended</text>
+
+          <rect class="box" x="270" y="30" width="170" height="96" rx="4"/>
+          <text x="355" y="58" text-anchor="middle" style="font-weight:800">Qwen3 8B</text>
+          <text x="355" y="74" text-anchor="middle">agent loop</text>
+          <text x="355" y="96" text-anchor="middle" class="label">search( )</text>
+          <text x="355" y="112" text-anchor="middle" class="label">open_document( )</text>
+
+          <rect class="box" x="460" y="50" width="130" height="56" rx="4"/>
+          <text x="525" y="76" text-anchor="middle" style="font-weight:800">Hybrid retriever</text>
+          <text x="525" y="94" text-anchor="middle">BM25 + dense + fusion</text>
+
+          <rect class="box" x="610" y="50" width="140" height="56" rx="4"/>
+          <text x="680" y="76" text-anchor="middle" style="font-weight:800">SQLite · FTS5</text>
+          <text x="680" y="94" text-anchor="middle" class="label">35,344 chunks</text>
+
+          <!-- horizontal arrows -->
+          <path class="arrow" d="M100,78 L118,78"/>
+          <path class="arrow" d="M250,78 L268,78"/>
+          <path class="arrow" d="M440,78 L458,78"/>
+          <path class="arrow" d="M590,78 L608,78"/>
+
+          <!-- output below agent -->
+          <rect class="box" x="270" y="170" width="170" height="60" rx="4"/>
+          <text x="355" y="198" text-anchor="middle" style="font-weight:800">Structured answer</text>
+          <text x="355" y="216" text-anchor="middle">+ doc_id citations</text>
+          <path class="arrow" d="M355,126 L355,168"/>
+        </svg>
+      </div>
+    </section>
+
+    <!-- ---------- MEASURED (bottom-left) ---------- -->
+    <section class="panel">
+      <div class="eyebrow">What we measured</div>
+      <h3>Honest baseline on&nbsp;the gold&nbsp;set</h3>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="n">35.3k</div>
+          <div class="l">Chunks indexed</div>
+        </div>
+        <div class="stat">
+          <div class="n">470</div>
+          <div class="l">Gold questions scored</div>
+        </div>
+        <div class="stat">
+          <div class="n">9</div>
+          <div class="l">Source types</div>
+        </div>
+      </div>
+
+      <table class="eval">
+        <thead>
+          <tr><th>k</th><th>Recall</th><th>MRR</th><th>nDCG</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>0.609</td><td>0.609</td><td>0.609</td></tr>
+          <tr><td>3</td><td>0.638</td><td>0.623</td><td>0.593</td></tr>
+          <tr><td>5</td><td>0.653</td><td>0.626</td><td>0.595</td></tr>
+          <tr><td>10</td><td class="win">0.860</td><td>0.653</td><td>0.660</td></tr>
+        </tbody>
+      </table>
+
+      <p style="margin-top: 4mm; color: var(--muted); font-size: 5.5mm;">
+        We replicated the published baseline, then found a parser bug silently
+        dropping 93 hard questions. True R@1 is 0.609 — not 0.67. The
+        R@1↔R@10 gap (0.25) is the target for cross-encoder reranking.
+      </p>
+    </section>
+
+    <!-- ---------- TRY (bottom-right) ---------- -->
+    <section class="panel">
+      <div class="eyebrow">Try it live</div>
+      <h3>Three skills, three&nbsp;demos</h3>
+
+      <div class="try-row">
+        <div class="try-text">
+          <p style="margin-bottom:3mm;"><b style="color:var(--accent)">Trace</b> — "Trace the office aquarium leak incident."</p>
+          <p style="margin-bottom:3mm;"><b style="color:var(--accent)">Decide</b> — "What did we decide about the gocritic paramTypeCombine rule?"</p>
+          <p style="margin-bottom:3mm;"><b style="color:var(--accent)">Onboard</b> — "Onboard me onto the Verbier Q4 ski retreat."</p>
+        </div>
+        <div class="qr-box">
+          [[TBD<br>QR code to<br>live demo]]
+        </div>
+      </div>
+
+      <p style="margin-top: 6mm; color: var(--muted); font-size: 5.5mm;">
+        Demo corpus uses deliberately rare vocabulary (aquarium, Verbier,
+        gocritic) so hybrid retrieval lands the demo docs at the top —
+        verified zero collisions with the 10k production corpus.
+      </p>
+    </section>
+  </main>
+
+  <!-- ====================== FOOTER ====================== -->
+  <footer class="footer">
+    <div>
+      <b>Stack:</b> TypeScript · Node · SQLite FTS5 · Ollama (qwen3:8b · nomic‑embed‑text) ·
+      Vanilla web UI · Nuvolos. &nbsp;
+      <b>Dataset:</b> EnterpriseRAG‑Bench (Onyx, MIT). &nbsp;
+      <b>Repo:</b> <span class="repo">github.com/EDEN757/company-rag-agent</span>
+    </div>
+    <div class="ack">
+      AI assistance used for code &amp; copy. No frameworks (no LangChain, no FAISS).
+    </div>
+  </footer>
+
+</div>
+
+</body>
+</html>
