@@ -41,8 +41,8 @@ from embed import DIM, embed_one  # noqa: E402
 import httpx  # noqa: E402
 
 TOP_K_PER_BRANCH = 16
-KW_W = 0.3
-VEC_W = 0.7
+KW_W = 0.7
+VEC_W = 0.3
 SCALE = 4
 THRESHOLD = 0.30
 RERANK_POOL = TOP_K_PER_BRANCH * 2  # mirrors fusion.ts: TOP_K_PER_BRANCH * 2
@@ -221,6 +221,7 @@ def ndcg(predicted: list[str], expected: set[str], k: int) -> float:
 
 
 def main() -> int:
+    global KW_W, VEC_W
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
     ap.add_argument("--questions", required=True)
@@ -231,7 +232,16 @@ def main() -> int:
         action="store_true",
         help="Enable cross-encoder reranking (requires reranker service on RERANKER_URL).",
     )
+    ap.add_argument("--kw-weight", type=float, default=None,
+                    help=f"Override KW_W (default {KW_W}).")
+    ap.add_argument("--vec-weight", type=float, default=None,
+                    help=f"Override VEC_W (default {VEC_W}).")
     args = ap.parse_args()
+    if args.kw_weight is not None:
+        KW_W = args.kw_weight
+    if args.vec_weight is not None:
+        VEC_W = args.vec_weight
+    print(f"[weights] vec={VEC_W}  kw={KW_W}")
 
     con = sqlite3.connect(args.db)
     print("[load] embedding matrix")

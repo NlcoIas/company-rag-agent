@@ -35,3 +35,22 @@ data/raw/documents_test.parquet
 .vscode/
 .idea/
 *.swp
+
+# Poster working files (keep SVG sources + build script + final PDF/PPTX)
+poster/uzh/preview-*.png
+poster/uzh/v*_*.png
+poster/uzh/company-rag-poster_*_backup.*
+poster/uzh/company-rag-poster_*_postmerge.*
+poster/uzh/architecture.png
+poster/uzh/ablation_chart.png
+poster/uzh/portrait-extracted/
+poster/debug_shapes.py
+poster/build_poster_v33_backup.py
+
+# Eval / smoke-test logs and our-fix scratch files
+data/*.log
+data/*.err
+data/*.json
+data/*.our-fix
+data/*.our-crlf-fix
+data/consistency_runs.json

@@ -3,8 +3,11 @@ import { embedQuery } from "./embed.js";
 import { rerank } from "./rerank.js";
 
 export const TOP_K_PER_BRANCH = 16;
-export const KW_WEIGHT = 0.3;
-export const VEC_WEIGHT = 0.7;
+// Tuned on our 10k-subset corpus: 0.3 vec / 0.7 kw beats the published
+// 0.7/0.3 by ~9 pp R@1 and ~3 pp R@10 (eval on 377 answerable questions,
+// data/sweep_mq_03_07_rerank.log). Multi-query keeps this ordering intact.
+export const KW_WEIGHT = 0.7;
+export const VEC_WEIGHT = 0.3;
 export const SCORE_THRESHOLD = 0.30;
 export const SCORE_SCALE = 4;
 

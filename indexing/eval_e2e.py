@@ -48,8 +48,8 @@ from embed import DIM, embed_one  # noqa: E402
 
 # ── retrieval constants (keep in sync with fusion.ts / eval_retrieval.py) ────
 TOP_K_PER_BRANCH = 16
-KW_W = 0.3
-VEC_W = 0.7
+KW_W = 0.7
+VEC_W = 0.3
 SCALE = 4
 THRESHOLD = 0.30
 RERANK_POOL = TOP_K_PER_BRANCH * 2
