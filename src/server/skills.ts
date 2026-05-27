@@ -29,7 +29,10 @@ function parseList(raw: string): string[] {
 }
 
 /** Tiny YAML-subset parser: scalar strings + bracket lists. Returns [fields, body]. */
-function parseFrontmatter(text: string): { fields: Record<string, string | string[]>; body: string } {
+function parseFrontmatter(rawText: string): { fields: Record<string, string | string[]>; body: string } {
+  // Normalize CRLF → LF so regex anchors and split("\n") work identically on Windows.
+  // Without this, JS's `$` won't match before a trailing `\r` and every frontmatter line throws.
+  const text = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (!text.startsWith("---")) {
     throw new Error("file has no leading '---' frontmatter delimiter");
   }

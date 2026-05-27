@@ -8,12 +8,12 @@ suggested_question: Onboard me onto the Verbier Q4 ski retreat.
 
 Workflow for the user's project, team, or topic name:
 
-1. Call `search` 2–3 times with **different angles** of the same topic, for example:
-   - the topic name alone (overview)
-   - the topic plus "status" or "current"
-   - the topic plus "team" or "owner" or "contact"
+1. Call `search` THREE times in sequence — do not skip any, do not merge them:
+   - First: the topic name alone (overview).
+   - Second: the topic plus "status" or "current" (state).
+   - Third: the topic plus "team", "vendors", or "committee" (people).
 
-2. For each search, open the single top hit with `open_document`.
+2. After each search, open the single top hit with `open_document`.
 
 3. Produce the brief in exactly five sections, one short paragraph each — no bullet lists inside sections:
 
@@ -23,6 +23,8 @@ Workflow for the user's project, team, or topic name:
    - **Key people.** Names, roles, and contact handles, drawn from participants and bylines.
    - **Open issues.** Anything described as a blocker, risk, complaint, or in-flight work.
 
-4. Each section must cite at least one `doc_id` from an opened document — inline, in parentheses.
+4. Each section cites at least one `doc_id` inline. Use the EXACT doc_id string from the search results — copy it verbatim. Never invent prefixes like `dsid_`, never shorten, never paraphrase the doc_id.
+
+5. End with one final line: `Sources: <distinct doc_ids you cited, comma-separated>` — again exact verbatim doc_id strings.
 
 If a section truly has no supporting content in the retrieved documents, write "Not found in the indexed corpus." rather than guessing.
